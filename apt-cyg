@@ -1,0 +1,1021 @@
+#!/bin/bash
+
+# apt-cyg: install tool for cygwin similar to debian apt-get
+#
+# Copyright (C) 2005-9, Stephen Jungels
+# Copyright (C) 2013, Alexey Shumkin
+# Copyright (C) 2013, Denny Schäfer
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# (http://www.fsf.org/licensing/licenses/gpl.html)
+
+# this script requires some packages
+
+APT_CYG_VERSION='0.57.6'
+APT_CYG="$0"
+if test "${APT_CYG:0:1}" != "/"
+then
+  APT_CYG="$(pwd)/$APT_CYG"
+fi
+
+function check_dependencies
+{
+  DEPENDENCIES="wget bzip2 xz tar awk"
+
+  deps_ok=YES
+  for dep in $DEPENDENCIES
+  do
+    if ! which $dep &>/dev/null; then
+      echo -e "You must install $dep to use apt-cyg"
+      deps_ok=NO
+    fi
+  done
+
+  if test "$deps_ok" = "NO"; then
+    echo -e "Aborting!"
+    exit 1
+  else
+    return 0
+  fi
+}
+
+function usage()
+{
+  show_version
+  cat <<EOF
+  apt-cyg: Installs and removes Cygwin packages.
+  "apt-cyg install <package names>" to install packages
+  "apt-cyg localinstall <package names>" to install packages from tars
+  "apt-cyg remove <package names>" to remove packages
+  "apt-cyg outdated [<package names>]" to list outdated packages (or test specifes ones)
+  "apt-cyg update" to update setup.ini
+  "apt-cyg upgrade" to upgrade outdated packages
+  "apt-cyg show" to show installed packages
+  "apt-cyg find <patterns>" to find packages matching patterns
+  "apt-cyg describe <patterns>" to describe packages matching patterns
+  "apt-cyg packageof <commands or files>" to locate parent packages
+Options:
+  --arch, -a <arch>          : redefine architecture (intended for fetching on different architecture machine)
+  --prefix, -p <prefix>      : prefix to install packages to (for debug purposes; must be set first)
+  --mirror, -m <url>         : set mirror
+  --cache, -c <dir>          : set cache
+  --category, -C <category>  : install packages from specified category
+                               (mostly for using with --fetch (for pre-fetching))
+  --debug                    : debug mode (do not remove some temprorary files)
+  --fetch                    : fetch files only (not install)
+  --file, -f <file>          : read package names from file
+  --force, -F                : force install (for "install" only)
+  --noupdate, -u             : don't update setup.ini from mirror
+  --ignore-errors, -I        : ignore errors (for fetching only)
+  --wget-options, -w <opt>   : pass option to wget
+  --help                     : show this help
+  --verbose, -v              : be verbose (show package versions, not just names)
+  --version                  : show version info
+EOF
+  show_current_settings
+}
+
+function show_version()
+{
+    echo apt-cyg version $APT_CYG_VERSION
+}
+function version()
+{
+  show_version
+  cat <<EOF
+Written by Stephen Jungels
+
+Copyright (c) 2005-9 Stephen Jungels.  Released under the GPL.
+Copyright (c) 2013 Alexey Shumkin.
+Copyright (c) 2013 Denny Schäfer.
+EOF
+}
+
+function mirror_name_url_to_file
+{
+    local arg="$1"
+    arg=${arg//%3a/:}
+    arg=${arg//%2f//}
+    echo $arg
+}
+
+function mirror_name_file_to_url
+{
+    local arg="$1"
+    arg=${arg//:/%3a}
+    arg=${arg//\//%2f}
+    echo $arg
+}
+
+function findworkspace()
+{
+  # default working directory and mirror
+
+  mirror=http://mirrors.kernel.org/sourceware/cygwin
+  cache=/setup
+
+  # work wherever setup worked last, if possible
+
+  if test -e $SETUP_DIR/last-cache
+  then
+    tmp="$(head -1 $SETUP_DIR/last-cache)"
+    cache="$(cygpath -au "$tmp")"
+  fi
+
+  if test -e $SETUP_DIR/last-mirror
+  then
+    mirror="$(head -1 $SETUP_DIR/last-mirror)"
+  fi
+  mirror=$(mirror_name_url_to_file "$mirror")
+  mirrordir=$(mirror_name_file_to_url "$mirror")
+
+  echo Working directory is $cache
+  echo Mirror is $mirror
+  if mkdir -p "$cache/$mirrordir/$arch"
+  then
+      cd "$cache/$mirrordir/$arch"
+  else
+      echo Cannot create cache dir. Exiting... >&2
+      exit 1
+  fi
+}
+
+function getarchitecture()
+{
+  if test -n "$arch"
+  then
+      return
+  fi
+  cygwinarch=$(uname -m)
+  case $cygwinarch in
+      "i686")
+      arch="x86"
+    ;;
+      "x86_64")
+      arch="x86_64"
+    ;;
+    *)
+      echo "Cannot determine cygwin architecture"
+      exit 1
+    ;;
+  esac
+}
+
+function getsetup()
+{
+  if test "$noscripts" == "0" -a "$noupdate" == "0"
+  then
+    touch setup.ini
+    mv setup.ini setup.ini-save
+    wget -N ${wget_options//--no-clobber} $mirror/$arch/setup.bz2
+    if test -e setup.bz2 && test $? -eq 0
+    then
+      bunzip2 setup.bz2
+      if test $? -ne 0
+      then
+          echo Error unpacking setup.ini
+      else
+          mv setup setup.ini
+          echo Updated setup.ini
+      fi
+    fi
+    if ! test -f setup.ini
+    then
+      wget -N ${wget_options//--no-clobber} $mirror/$arch/setup.ini
+      if test -e setup.ini && test $? -eq 0
+      then
+        echo Updated setup.ini
+      else
+        mv setup.ini-save setup.ini
+        echo Error updating setup.ini, reverting
+      fi
+    fi
+  fi
+}
+
+
+function checkpackages()
+{
+  if test ${#packages[@]} == 0
+  then
+    echo Nothing to do, exiting
+    exit 0
+  fi
+}
+
+function escape_package_name()
+{
+    if test "$1" == "."
+    then
+        # special case - any name
+        echo $1
+        exit
+    fi
+    # escape special chars in package name (if any)
+    echo $1 | sed -e "s/[+.*()&?]/\\\\&/g"
+}
+
+function gen_tmp_awk()
+{
+    tmp_awk="/tmp/awk.$$"
+}
+
+function listoutdated()
+{
+    file_installed=/tmp/apt-cyg.installed.$$_
+    file_available=/tmp/apt-cyg.available.$$_
+    >$file_installed
+    >$file_available
+    if test ${#packages[@]} -eq 0
+    then
+        show_installed_packages 1 "$pkg" >>$file_installed
+        # set package name to "any" (regexp)
+        # as empty package name means to find by category
+        show_available_packages 1 '.' >>$file_available
+    else
+        for pkg in "${packages[@]}"
+        do
+            show_installed_packages 1 "$pkg" >>$file_installed
+            # set package name to "any" (regexp)
+            # as empty package name means to find by category
+            show_available_packages 1 "$pkg" >>$file_available
+        done
+    fi
+    if ! test -s $file_available
+    then
+        echo WARNING! Available packages list is empty! 1>&2
+    fi
+    packages_changed=$(diff -d -y $file_installed $file_available  | grep -e '|' | awk '{ print $1 }')
+    q_verbose="$1"
+    for pkg in $packages_changed
+    do
+        e_pkg="$(escape_package_name "$pkg")"
+        version_installed=$(awk "/^$e_pkg /"'{print $2}' $file_installed)
+        version_available=$(awk "/^$e_pkg /"'{print $2}' $file_available)
+        if test "$version_installed" \< "$version_available"
+        then
+            if test $q_verbose -eq 1
+            then
+                echo "Package $pkg is outdated ($version_installed < $version_available)"
+            else
+                echo $pkg
+            fi
+        elif test -z "$version_available"
+        then
+            echo "Warning: Package $pkg ($version_installed) is absent on this mirror" >&2
+        fi
+    done
+    if test $debug -eq 0
+    then
+        rm $file_installed $file_available
+    else
+        echo DEBUG: installed: $file_installed >&2
+        echo DEBUG: available: $file_available >&2
+    fi
+}
+
+function unpack()
+{
+    file="$1"
+
+    file_extension="${file##*.}"
+
+    case "$file_extension" in
+      xz)
+        format="xz"
+        unpack_tool="xzcat"
+      ;;
+      bz2)
+        format="bz2"
+        unpack_tool="bunzip2"
+      ;;
+    esac
+
+    # if localinstall
+    if test -n "$2"
+    then
+        # set pkg name from filename
+        pkg=$(basename "$pkg")
+        pkg=${pkg%.tar.$format}
+        pkg=${pkg/%-[0-9]*}
+    fi
+
+    echo "Unpacking..."
+    cat "$file" | $unpack_tool | tar > "$SETUP_DIR/$pkg.lst" xvf - -C $prefix/
+    gzip -f "$SETUP_DIR/$pkg.lst"
+}
+
+function do_postinstall()
+{
+    if test -n "$prefix"
+    then
+        echo "--prefix is not empty. Skipping postinstall scripts" 1>&2
+        return
+    fi
+    pis=$(ls /etc/postinstall/*.sh 2>/dev/null | wc -l)
+    if test $pis -gt 0 && ! test $noscripts -eq 1
+    then
+      echo Running postinstall scripts
+      for script in /etc/postinstall/*.sh
+      do
+        $script
+        mv $script $script.done
+      done
+    fi
+}
+
+function get_package_desc_file()
+{
+    local pkg="$1"
+    local ignore_errors="$2"
+    pkg_desc="/tmp/apt-cyg.$pkg.desc"
+    awk < setup.ini > "$pkg_desc" -v package="$pkg" \
+      'BEGIN {
+          RS="\n\n@ ";
+          FS="\n"
+       }
+       {
+           if ($1 == package) {
+               desc = $0;
+               px++
+           }
+       }
+       END {
+           if (px == 1 && desc != "")
+               print desc
+           else
+               print ""
+       }'
+
+    local desc=$(< "$pkg_desc")
+    if test -z "$desc"
+    then
+      rm "$pkg_desc"
+      echo -n Package $pkg not found or ambiguous name >&2
+      if test -z "$ignore_errors"
+      then
+          echo , exiting >&2
+          exit 1
+      else
+          echo
+          pkg_desc=
+      fi
+    fi
+    # if found (or no errors ignored)
+    if test -n "$pkg_desc"
+    then
+        echo Found package $pkg >&2
+    fi
+}
+
+function download_package()
+{
+    local pkg_desc="$1"
+    local ignore_errors="$2"
+
+    # pick the latest version, which comes first
+    local install=$(awk '/^install: / { print $2; exit }' "$pkg_desc")
+
+    if test "-$install-" = "--"
+    then
+      echo "Could not find \"install\" in package description: obsolete package?" >&2
+      rm "$pkg_desc"
+      exit 1
+    fi
+
+    local pkg_dir=$(dirname "${install#$arch/}")
+    # downloaded_file is used later outside
+    downloaded_file=$(basename "$install")
+    mkdir -p "$pkg_dir"
+    pushd "$pkg_dir" 1>/dev/null
+    wget $wget_options $mirror/$install
+
+    # verify the checksum
+    local digest=$(awk '/^install: / { print $4; exit }' "$pkg_desc")
+    local digactual=$(sha512sum $downloaded_file | awk '{print $1}')
+    if ! test "$digest" = "$digactual"
+    then
+      echo -n "Checksum did not match" >&2
+      if test -z "$ignore_errors"
+      then
+          echo , exiting >&2
+          exit 1
+      else
+          echo , ignoring >&2
+      fi
+    fi
+}
+
+function array_contains() {
+    local a
+    for a in "${@:2}"; do [[ "$a" == "$1" ]] && return 0; done
+    return 1
+}
+
+function get_requirements_list()
+{
+    local pkg="$1"
+    local ignore_errors="$2"
+    if test -z "$pkg"
+    then
+        echo "Getting requirements..." >&2
+        for pkg in "${packages[@]}"
+        do
+            get_requirements_list "$pkg" "$ignore_errors"
+        done
+        # comment line below to see requirements only
+        return
+
+        for req in "${requirements[@]}"
+        do
+            echo $req
+        done
+        exit
+
+    else
+        get_package_desc_file "$pkg" "$ignore_errors"
+        if test -z "$pkg_desc"
+        then
+            return
+        fi
+        # recursively install required packages
+        local requires=$(awk '/^requires: / {s=gensub("(requires: )?([^ ]+) ?", "\\2 ", "g", $0); print s}' "$pkg_desc")
+
+        for req in $requires
+        do
+            if ! array_contains "$req" "${requirements[@]}"
+            then
+                requirements[${#requirements[@]}]="$req"
+                get_requirements_list "$req" "$ignore_errors"
+            fi
+        done
+    fi
+}
+
+function update_installed_db
+{
+    gen_tmp_awk
+    awk < $INSTALLED_DB > $tmp_awk -v pkg="$pkg" -v bz="$file" -v ins=0 \
+      "{
+          if (ins != 1 && pkg <= \$1) {
+              print pkg \" \" bz \" 0\";
+              ins=1
+              if (pkg == \$1)
+                  noprint=1
+         };
+         if (!noprint)
+             print \$0;
+         noprint=0
+      }
+      END { if (ins != 1) print pkg \" \" bz \" 0\"}"
+    mv $INSTALLED_DB $INSTALLED_DB-save
+    mv $tmp_awk $INSTALLED_DB
+}
+
+function fetch_and_install()
+{
+    local fetch_only="$1"
+    local ignore_errors="$2"
+    # ignoring MD5 sum is for fetching only
+    if test -n "$fetch_only" -a -n "$ignore_errors"
+    then
+        ignore_errors="ignore"
+    else
+        ignore_errors=
+    fi
+
+    get_requirements_list "" "$ignore_errors"
+
+    for pkg in "${requirements[@]}" "${packages[@]}"
+    do
+
+        if test -z "$fetch_only"
+        then
+            already=$(grep -c "^$pkg " $INSTALLED_DB)
+            if test "$already" -ge 1
+            then
+              if test -z "$force"
+              then
+                  echo Package $pkg is already installed, skipping
+                  continue
+              else
+                  echo Package $pkg is already installed but forced reinstall
+              fi
+            fi
+            echo ""
+        fi
+
+        # look for package and save desc file
+        # download the bz2 file
+        get_package_desc_file "$pkg" "$ignore_errors"
+
+        if test -z "$pkg_desc"
+        then
+            continue
+        fi
+
+        echo Fetching $pkg
+
+        download_package "$pkg_desc" "$ignore_errors"
+
+        if test -n "$fetch_only"
+        then
+            # pushd is in `download_package`
+            popd 1>/dev/null
+            rm "$pkg_desc"
+            continue
+        fi
+
+        # unpack the bz2 file
+        unpack "$downloaded_file"
+        # pushd is in `download_package`
+        popd 1>/dev/null
+
+        # update the package database
+        update_installed_db
+
+        echo Package $pkg installed
+        rm "$pkg_desc"
+
+    done
+
+    if test -n "$fetch_only"
+    then
+        # run all postinstall scripts
+        do_postinstall
+    fi
+}
+
+function show_installed_packages()
+{
+    q_verbose=$1
+    query="$(escape_package_name "$2")"
+    # remove ".tar.bz2" extension
+    # print version (cut from "<pkg> <pkg>-version" string)
+    # sort list (started with underscores are last)
+    awk < $INSTALLED_DB -v verbose=$q_verbose -v query="$query" \
+        '/[^ ]+ [^ ]+ 0/ {
+            if (length(query) == 0 || $1 ~ query ) {
+                NF=verbose+1;
+                if (NF > 1) {
+                    sub(/\.tar\.bz2$/, "", $2);
+                    r=$1;
+                    gsub(/[+.*()&#?]/, "\\\\&", r);
+                    r="^"r"-";
+                    sub(r, "", $2)
+                };
+                print
+            }
+        }' | sort | sed -e '/^_/{$!{H;d}}; $G' | sed -e '/^$/d'
+}
+
+function show_available_packages()
+{
+    q_verbose=$1
+    query="$(escape_package_name "$2")"
+    category="$3"
+    # print version (found "version:" field"
+    # sort list (started with underscores are last)
+    awk < setup.ini -v query="$query" -v verbose=$q_verbose -v version_re="^version: " \
+        -v requires_re="^requires: " \
+        -v category_re="^category: " -v category="\\\<$category\\\>" \
+        'BEGIN {
+            RS="\n\n@ ";
+            FS="\n";
+            ORS="\n"
+        }
+        {
+            if ($1 ~ "^#") next;
+            matched=""
+            requires=""
+            if (query == "") {
+                for(i=1; i<=NF; i++) {
+                    if ($i ~ requires_re) {
+                        requires=$i
+                        sub(requires_re, "", requires)
+                    } else if ($i ~ category_re && $i ~ category) {
+                        sub(category_re, "", $i)
+                        matched=$1
+                    }
+                }
+                if (matched) print matched, requires
+            } else if ($1 ~ query) {
+                if (verbose == 0)
+                    NF=1
+                else {
+                    for(i=3; i<=NF; i++) {
+                        if ($i ~ version_re) {
+                            $2=$i;
+                            NF=2;
+                            sub(version_re, "", $2)
+                        }
+                    }
+                };
+                if (NF>2)
+                    NF=1;
+                print
+            }
+        }' | sort | sed -e '/^_/{$!{H;d}}; $G' | sed -e '/^$/d'
+}
+
+function upgrade()
+{
+    file_outdated=/tmp/apt-cyg.outdated.$$
+    listoutdated 0 > $file_outdated
+    for pkg in $(< $file_outdated)
+    do
+        "$APT_CYG" --prefix "$prefix" install --noupdate --force $fetch_only "$pkg"
+    done
+    rm $file_outdated
+}
+
+function init_vars()
+{
+    SETUP_DIR=$prefix/etc/setup
+    if test -n "$prefix"
+    then
+        mkdir -p $SETUP_DIR
+    fi
+    INSTALLED_DB=$SETUP_DIR/installed.db
+    if test -n "$prefix" -a ! -f "$INSTALLED_DB"
+    then
+        # touch file if absent to avoid errors
+        > "$INSTALLED_DB"
+    fi
+}
+
+function unpack_packages()
+{
+    for pkg in "${packages[@]}"
+    do
+        if ! test -f "$pkg"
+        then
+            echo Warning: File "$pkg" not found! Skipping >&2
+            continue
+        fi
+        unpack "$pkg" 1
+    done
+}
+
+fill_packages()
+{
+    local file="$1"
+    local packages_category="$2"
+    local recursively="$3"
+
+    if test -f "$file"
+    then
+        local filepackages=$(< $file)
+        for f_file in ${filepackages[@]}
+        do
+            packages[${#packages[@]}]="$f_file"
+        done
+    fi
+    if test -n "$packages_category"
+    then
+        findworkspace
+        file_category=/tmp/apt-cyg.category.$$_
+        show_available_packages $verbose "" "$packages_category" $recursively > "$file_category"
+        fill_packages "$file_category"
+    fi
+}
+
+function show_current_settings
+{
+    echo
+    echo Current mirror set:
+    cat $SETUP_DIR/last-mirror
+    echo Cache dir set:
+    cat $SETUP_DIR/last-cache
+}
+
+# commands functions
+function command_describe
+{
+    checkpackages
+    findworkspace
+    getsetup
+    for pkg in "${packages[@]}"
+    do
+      echo ""
+      awk < setup.ini -v query="$pkg" \
+        'BEGIN {
+            RS="\n\n@ ";
+            FS="\n";
+            ORS="\n"
+        }
+        { if ($1 ~ query) {print $0 "\n"} }'
+    done
+}
+
+function command_find
+{
+    checkpackages
+    findworkspace
+    getsetup
+
+    for pkg in "${packages[@]}"
+    do
+      echo ""
+      echo Searching for installed packages matching $pkg:
+      show_installed_packages $verbose "$pkg"
+      echo ""
+      echo Searching for installable packages matching $pkg:
+      show_available_packages $verbose "$pkg"
+    done
+}
+
+function command_localinstall
+{
+    checkpackages
+    unpack_packages
+    update_installed_db
+    do_postinstall
+}
+
+function command_install
+{
+    checkpackages
+    findworkspace
+    getsetup
+    fetch_and_install $fetch_only $ignore_errors
+}
+
+function command_packageof
+{
+    checkpackages
+    for pkg in "${packages[@]}"
+    do
+      key=$(which "$pkg" 2>/dev/null | sed "s:^/::")
+      if test "-$key-" = "--"
+      then
+        key="$pkg"
+      fi
+      for manifest in $SETUP_DIR/*.lst.gz
+      do
+        found=$(cat $manifest | gzip -d | grep -c "$key")
+        if test $found -gt 0
+        then
+          package=$(echo $manifest | sed -e "s:$SETUP_DIR/::" -e "s/.lst.gz//")
+          echo Found $key in the package $package
+        fi
+      done
+    done
+}
+
+function command_remove
+{
+
+    checkpackages
+    for pkg in "${packages[@]}"
+    do
+
+    already=$(grep -c "^$pkg " $INSTALLED_DB)
+    if test "$already" = 0
+    then
+      echo Package $pkg is not installed, skipping
+      continue
+    fi
+
+    dontremove="cygwin coreutils gawk bzip2 tar wget bash"
+    for req in $dontremove
+    do
+      if test "-$pkg-" = "-$req-"
+      then
+        echo apt-cyg cannot remove package $pkg, exiting >&2
+        exit 1
+      fi
+    done
+
+    if ! test -e "$SETUP_DIR/$pkg.lst.gz"
+    then
+      echo Package manifest missing, cannot remove $pkg. Exiting >&2
+      exit 1
+    fi
+    echo Removing $pkg
+
+    # run preremove scripts
+
+    if test -e "/etc/preremove/$pkg.sh"
+    then
+      "/etc/preremove/$pkg.sh"
+      rm "/etc/preremove/$pkg.sh"
+    fi
+
+    cat "$SETUP_DIR/$pkg.lst.gz" | gzip -d | awk '/[^\/]$/ {print "rm -f \"/" $0 "\""}' | sh
+    rm "$SETUP_DIR/$pkg.lst.gz"
+    rm -f /etc/postinstall/$pkg.sh.done
+    gen_tmp_awk
+    awk < $INSTALLED_DB > $tmp_awk -v pkg="$pkg" '{if (pkg != $1) print $0}'
+    mv $INSTALLED_DB $INSTALLED_DB-save
+    mv $tmp_awk $INSTALLED_DB
+    echo Package $pkg removed
+
+    done
+}
+
+function command_show
+{
+    echo 1>&2 The following packages are installed:
+    show_installed_packages $verbose
+}
+
+function command_outdated
+{
+    findworkspace
+    getsetup
+    listoutdated $verbose
+}
+
+function command_update
+{
+    findworkspace
+    getsetup
+}
+
+function command_upgrade
+{
+    findworkspace
+    getsetup
+    upgrade
+}
+
+# process options
+
+# on Linux box emulate `cygpath`
+if ! which cygpath &>/dev/null
+then
+    function cygpath()
+    {
+        echo "$2"
+    }
+fi
+noscripts=0
+noupdate=0
+fetch_only=""
+file=""
+force=""
+verbose=0
+command=""
+packages_category=""
+packages=()
+prefix=""
+wget_options="--no-clobber"
+arch=""
+requirements=()
+ignore_errors=
+debug=0
+
+# check apt-cyg dependencies
+check_dependencies
+
+# initialize SETUP_DIR and INSTALLED_DB
+init_vars
+
+while test $# -gt 0
+do
+  case "$1" in
+
+    --arch|-a)
+        arch="$2"
+        shift; shift
+    ;;
+
+    --prefix|-p)
+        prefix="$2"
+        # REinitialize SETUP_DIR and INSTALLED_DB
+        init_vars
+        shift; shift
+    ;;
+
+    --mirror|-m)
+      mirror_name_url_to_file "$2" > $SETUP_DIR/last-mirror
+      shift ; shift
+    ;;
+
+    --cache|-c)
+      cygpath -aw "$2" > $SETUP_DIR/last-cache
+      shift ; shift
+    ;;
+
+  --category|-C)
+      packages_category="$2"
+      shift; shift
+    ;;
+
+    --noscripts)
+      noscripts=1
+      shift
+    ;;
+
+    --noupdate|-u)
+      noupdate=1
+      shift
+    ;;
+
+    --ignore-errors|-I)
+      ignore_errors="ignore"
+      shift
+    ;;
+
+    --help)
+      usage
+      exit 0
+    ;;
+
+    --verbose)
+      verbose=1
+      shift
+    ;;
+
+    --debug)
+      debug=1
+      shift
+    ;;
+
+    --version)
+      version
+      exit 0
+    ;;
+
+    --fetch)
+        fetch_only="$1"
+        shift
+    ;;
+
+    --file|-f)
+      if test "-$2-" = "--"
+      then
+          echo 1>&2 No file name provided, ignoring $1
+      else
+        file="$2"
+        if ! test -f "$file"
+        then
+            echo File $file not found, skipping >&2
+          file=""
+        fi
+        shift
+      fi
+      shift
+    ;;
+
+	--force|-F)
+		force="$1"
+		shift
+	;;
+
+    -w|--wget-options)
+        wget_options="$wget_options $2"
+        shift; shift
+    ;;
+
+    outdated|update|upgrade|show|find|describe|packageof|install|localinstall|remove)
+      if test "-$command-" = "--"
+      then
+        command=$1
+      else
+        packages[${#packages[@]}]="$1"
+      fi
+      shift
+
+    ;;
+
+    *)
+      packages[${#packages[@]}]="$1"
+      shift
+
+    ;;
+
+  esac
+done
+
+# determine if cygwin runing in x86 or x86_64
+getarchitecture
+
+fill_packages "$file" "$packages_category" 1
+
+case "$command" in
+
+  outdated|update|upgrade|show|find|describe|packageof|install|localinstall|remove)
+      # execute an appropriate function
+      command_$command
+  ;;
+
+  *)
+
+    usage
+
+  ;;
+
+esac
+
+# vim: set filetype=sh tabstop=4 shiftwidth=4 expandtab:
